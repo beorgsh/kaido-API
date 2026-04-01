@@ -230,9 +230,14 @@ class Kaido:
         return {"query": q, "total": len(results), "results": results}
 
     # ---------------- INFO ----------------
+    # ---------------- INFO ----------------
     async def get_info(self, anime_id: str):
         page = await self.context.new_page()
         await page.goto(f"{BASE_URL}/{anime_id}", wait_until="domcontentloaded")
+
+        # Scroll to the bottom of the page to trigger Kaido's lazy-loading
+        # for the "Recommended" section and Images.
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
         await asyncio.sleep(2.5)
 
         data = await page.evaluate("""
@@ -291,7 +296,7 @@ class Kaido:
                 const text = span.innerText.trim();
                 if (text && !span.className.includes("tick-")) {
                     if (/\\dm$/.test(text) || text.includes("m")) info.stats.duration = text;
-                    else if (text.includes("TV") || text.includes("Movie") || text.includes("OVA") || text.includes("ONA") || text.includes("Special")) info.stats.type = text;
+                    else if (['TV', 'Movie', 'OVA', 'ONA', 'Special'].includes(text)) info.stats.type = text;
                 }
             });
 
@@ -328,19 +333,32 @@ class Kaido:
             const syncAni = document.querySelector("[data-sync='anilist'], [data-anilist-id]");
             if (syncAni) info.anilist_id = parseInt(syncAni.getAttribute("data-anilist-id") || syncAni.getAttribute("data-id"));
 
-            // Parse Seasons List
+            // Parse Seasons List (With advanced image parsing)
             document.querySelectorAll(".os-list a").forEach(a => {
+                let pUrl = null;
+                let bgEl = a.querySelector('.season-poster, .os-poster, div[style*="background"]');
+                if (bgEl) {
+                    let style = bgEl.getAttribute('style') || '';
+                    let match = style.match(/url\\(['"]?(.*?)['"]?\\)/);
+                    if (match) pUrl = match[1];
+                }
+                if (!pUrl) {
+                    let img = a.querySelector('img');
+                    if (img) pUrl = img.getAttribute('data-src') || img.src;
+                }
+                
                 info.seasons.push({
                     id: a.href.split("/").pop().split("?")[0],
                     title: a.getAttribute("title") || a.innerText.trim(),
                     is_current: a.classList.contains("active"),
-                    poster: a.querySelector("div")?.getAttribute("style")?.match(/url\\(['"]?(.*?)['"]?\\)/)?.[1] || null
+                    poster: pUrl // Note: If Kaido only has text buttons for seasons, this will be null.
                 });
             });
 
             // Helper to parse mini-items (Recommended & Popular)
             const parseMiniItem = (el) => {
-                const a = el.querySelector(".film-name a, .dynamic-name");
+                if (!el) return null;
+                const a = el.querySelector(".film-name a, .dynamic-name, .film-detail a, .film-title a");
                 if (!a) return null;
                 const id = a.href?.split("/").pop().split("?")[0];
                 if (!id) return null;
@@ -349,12 +367,21 @@ class Kaido:
                 const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
                 const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
                 
+                // Aggressive Type Scraper (Looks through all spans to find TV/Movie/OVA)
+                let itemType = null;
+                el.querySelectorAll('.fdi-item, .tick-item, .type, span').forEach(node => {
+                    let txt = node.innerText.trim();
+                    if (['TV', 'Movie', 'OVA', 'ONA', 'Special', 'Music'].includes(txt)) {
+                        itemType = txt;
+                    }
+                });
+                
                 return {
                     id: id,
                     title: a.innerText?.trim() || a.getAttribute("title"),
                     japanese_title: a.getAttribute("data-jname") || null,
-                    poster: el.querySelector("img")?.getAttribute("data-src") || el.querySelector("img")?.src,
-                    type: el.querySelector(".fdi-item:not(.fdi-duration)")?.innerText?.trim() || null,
+                    poster: el.querySelector("img")?.getAttribute("data-src") || el.querySelector("img")?.src || null,
+                    type: itemType,
                     episodes: {
                         sub: sub ? parseInt(sub) : null,
                         dub: dub ? parseInt(dub) : null,
@@ -363,11 +390,33 @@ class Kaido:
                 };
             };
 
-            // Parse Recommended
-            info.recommended = [...document.querySelectorAll("#anime-recommended .flw-item")].map(parseMiniItem).filter(x => x && x.id);
+            // DYNAMICALLY FIND "RECOMMENDED" SECTION
+            let recItems = [];
+            document.querySelectorAll("h2, .cat-heading").forEach(h => {
+                if (h.innerText.toLowerCase().includes("recommended")) {
+                    let container = h.closest(".block_area, section, div.container, .wrap");
+                    if (container) {
+                        let items = container.querySelectorAll(".flw-item");
+                        if (items.length > 0) recItems = Array.from(items);
+                    }
+                }
+            });
+            if (recItems.length === 0) recItems = document.querySelectorAll("#anime-recommended .flw-item"); // Fallback
+            info.recommended = [...recItems].map(parseMiniItem).filter(x => x && x.id);
 
-            // Parse Most Popular (Sidebar)
-            info.most_popular = [...document.querySelectorAll("#toppopular ul li, .mop-list li, .sidebar-list li")].map(parseMiniItem).filter(x => x && x.id);
+            // DYNAMICALLY FIND "MOST POPULAR" SECTION
+            let popItems = [];
+            document.querySelectorAll("h2, .cat-heading").forEach(h => {
+                if (h.innerText.toLowerCase().includes("most popular")) {
+                    let container = h.closest(".block_area, section, .sidebar");
+                    if (container) {
+                        let items = container.querySelectorAll("ul li, .ulclear li");
+                        if (items.length > 0) popItems = Array.from(items);
+                    }
+                }
+            });
+            if (popItems.length === 0) popItems = document.querySelectorAll("#toppopular ul li, .mop-list li, .sidebar-list li"); // Fallback
+            info.most_popular = [...popItems].map(parseMiniItem).filter(x => x && x.id);
 
             return info;
         }
