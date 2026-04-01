@@ -367,14 +367,25 @@ class Kaido:
                 const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
                 const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
                 
-                // Aggressive Type Scraper (Looks through all spans to find TV/Movie/OVA)
                 let itemType = null;
-                el.querySelectorAll('.fdi-item, .tick-item, .type, span').forEach(node => {
-                    let txt = node.innerText.trim();
-                    if (['TV', 'Movie', 'OVA', 'ONA', 'Special', 'Music'].includes(txt)) {
-                        itemType = txt;
+                const validTypes = ['TV', 'MOVIE', 'OVA', 'ONA', 'SPECIAL', 'MUSIC'];
+                
+                // Method 1: Target common elements
+                el.querySelectorAll('.fdi-item, span').forEach(node => {
+                    let txt = node.innerText.trim().toUpperCase();
+                    if (validTypes.includes(txt)) {
+                        itemType = txt === 'MOVIE' ? 'Movie' : (txt === 'SPECIAL' ? 'Special' : (txt === 'MUSIC' ? 'Music' : txt));
                     }
                 });
+                
+                // Method 2: Fallback Regex on all text content (Bulletproof)
+                if (!itemType) {
+                    let match = (el.innerText || '').match(/\\b(TV|Movie|OVA|ONA|Special|Music)\\b/i);
+                    if (match) {
+                        let txt = match[1].toUpperCase();
+                        itemType = txt === 'MOVIE' ? 'Movie' : (txt === 'SPECIAL' ? 'Special' : (txt === 'MUSIC' ? 'Music' : txt));
+                    }
+                }
                 
                 return {
                     id: id,
