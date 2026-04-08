@@ -1,695 +1,852 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import requests
-from bs4 import BeautifulSoup
-import json as _json
+import json
+import asyncio
+import re
+import os
+import httpx
+from typing import Optional
+from contextlib import asynccontextmanager
 
-app = Flask(__name__)
-CORS(app)
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-ANIMEKAI_URL = "https://anikai.to/"
-ANIMEKAI_HOME_URL = "https://anikai.to/home"
-ANIMEKAI_SEARCH_URL = "https://anikai.to/ajax/anime/search"
-ANIMEKAI_EPISODES_URL = "https://anikai.to/ajax/episodes/list"
-ANIMEKAI_SERVERS_URL = "https://anikai.to/ajax/links/list"
-ANIMEKAI_LINKS_VIEW_URL = "https://anikai.to/ajax/links/view"
+from playwright.async_api import async_playwright, BrowserContext
+from playwright_stealth import Stealth
 
-ENCDEC_URL = "https://enc-dec.app/api/enc-kai"
-ENCDEC_DEC_KAI = "https://enc-dec.app/api/dec-kai"
-ENCDEC_DEC_MEGA = "https://enc-dec.app/api/dec-mega"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://anikai.to/",
-}
-
-AJAX_HEADERS = {**HEADERS, "X-Requested-With": "XMLHttpRequest"}
-
-_V_L_1 = [
-    114,
-    94,
-    91,
-    90,
-    31,
-    125,
-    70,
-    31,
-    104,
-    94,
-    83,
-    75,
-    90,
-    90,
-    90,
-    90,
-    90,
-    90,
-    90,
-    90,
-    90,
-    90,
-    77,
-    31,
-    88,
-    86,
-    75,
-    87,
-    74,
-    93,
-    17,
-    92,
-    80,
-    82,
-    16,
-    72,
-    94,
-    83,
-    75,
-    90,
-    77,
-    72,
-    87,
-    86,
-    75,
-    90,
-    18,
-    9,
-    6,
-]
-_K_L_1 = 0x3F
+BASE_URL = "https://kaido.to"
+IS_HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
 
-@app.after_request
-def _finalize_io_v4(r):
-    if r.is_json:
+class Kaido:
+    def __init__(self):
+        self.playwright = None
+        self.context: Optional[BrowserContext] = None
+
+    async def start(self):
+        self.playwright = await async_playwright().start()
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir="./browser_data",
+            headless=IS_HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--autoplay-policy=no-user-gesture-required",
+                "--mute-audio",
+            ],
+            ignore_https_errors=True,
+        )
+
+    async def stop(self):
+        if self.context:
+            await self.context.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+    def _map_server_name(self, name: str) -> str:
+        name = name.lower()
+        if "vidstreaming" in name:
+            return "hd-1"
+        if "vidcloud" in name:
+            return "hd-2"
+        return name
+
+    async def _fetch_anilist_metadata(self, title: str):
+        """Helper function to fetch AniList ID, MAL ID, and accurate Scores from AniList GraphQL"""
+        query = """
+        query ($search: String) {
+          Media (search: $search, type: ANIME) {
+            id
+            idMal
+            averageScore
+          }
+        }
+        """
         try:
-            d = r.get_json()
-            if isinstance(d, dict):
-                _s = "".join(chr(c ^ _K_L_1) for c in _V_L_1)
-                _new = {"Author": _s}
-                _new.update(d)
-                r.set_data(_json.dumps(_new))
-        except:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://graphql.anilist.co",
+                    json={"query": query, "variables": {"search": title}},
+                    timeout=5.0,
+                )
+                if response.status_code == 200:
+                    data = response.json().get("data", {}).get("Media")
+                    if data:
+                        return data
+        except Exception:
             pass
-    return r
-
-
-def encode_token(text):
-    try:
-        r = requests.get(ENCDEC_URL, params={"text": text}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("result") if data.get("status") == 200 else None
-    except Exception:
         return None
 
+    # ---------------- HOME ----------------
+    async def get_home(self):
+        page = await self.context.new_page()
+        await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded")
 
-def decode_kai(text):
-    try:
-        r = requests.post(ENCDEC_DEC_KAI, json={"text": text}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("result") if data.get("status") == 200 else None
-    except Exception:
-        return None
+        home_data = await page.evaluate("""
+        () => {
+            const safeText = (el, sel) => el.querySelector(sel)?.innerText?.trim() || null;
+            const safeAttr = (el, sel, attr) => el.querySelector(sel)?.getAttribute(attr) || null;
 
+            const parseItem = (el) => {
+                if (!el) return null;
+                const a = el.querySelector(".film-name a") || el.querySelector("a");
+                if (!a) return null;
+                const id = a.href?.split("/").pop().split("?")[0];
+                if (!id) return null;
+                
+                const sub = el.querySelector(".tick-sub")?.innerText?.replace(/[^0-9]/g, '');
+                const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
+                const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
 
-def decode_mega(text):
-    try:
-        r = requests.post(
-            ENCDEC_DEC_MEGA,
-            json={
-                "text": text,
-                "agent": HEADERS["User-Agent"],
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("result") if data.get("status") == 200 else None
-    except Exception:
-        return None
+                return {
+                    id: id,
+                    title: a.innerText?.trim() || a.getAttribute("title"),
+                    japanese_title: a.getAttribute("data-jname") || null,
+                    poster: safeAttr(el, "img", "data-src") || safeAttr(el, "img", "src"),
+                    episodes: {
+                        sub: sub ? parseInt(sub) : null,
+                        dub: dub ? parseInt(dub) : null,
+                        total: eps ? parseInt(eps) : null
+                    },
+                    type: el.querySelector(".fd-infor .fdi-item:not(.fdi-duration)")?.innerText?.trim() || null
+                };
+            };
 
+            const getSection = (primary, fallback) => {
+                let items = document.querySelectorAll(primary);
+                if (items.length === 0 && fallback) items = document.querySelectorAll(fallback);
+                return [...items].map(parseItem).filter(x => x && x.id);
+            };
 
-def parse_info_spans(info_el):
-    sub_eps = ""
-    dub_eps = ""
-    anime_type = ""
-    for span in info_el.find_all("span") if info_el else []:
-        cls = span.get("class", [])
-        if "sub" in cls:
-            sub_eps = span.get_text(strip=True)
-        elif "dub" in cls:
-            dub_eps = span.get_text(strip=True)
-        else:
-            b_tag = span.find("b")
-            if b_tag:
-                anime_type = span.get_text(strip=True)
-    return sub_eps, dub_eps, anime_type
+            const spotlight = [...document.querySelectorAll("#slider .swiper-slide")].map(el => {
+                const a = el.querySelector(".desi-buttons a");
+                return {
+                    id: a?.href?.split("/").pop().split("?")[0],
+                    title: safeText(el, ".desi-head-title"),
+                    japanese_title: safeAttr(el, ".desi-head-title", "data-jname"),
+                    poster: safeAttr(el, "img.film-poster-img", "data-src") || safeAttr(el, "img.film-poster-img", "src"),
+                    description: safeText(el, ".desi-description"),
+                    type: safeText(el, ".sc-detail .scd-item:nth-child(1)")
+                };
+            }).filter(x => x && x.id);
 
+            const trending = [...document.querySelectorAll("#trending-home .swiper-slide")].map(el => {
+                const a = el.querySelector(".film-title a") || el.querySelector("a");
+                return {
+                    id: a?.href?.split("/").pop().split("?")[0],
+                    title: safeText(el, ".film-title"),
+                    japanese_title: a?.getAttribute("data-jname") || null,
+                    poster: safeAttr(el, "img.film-poster-img", "data-src") || safeAttr(el, "img.film-poster-img", "src"),
+                    rank: parseInt(safeText(el, ".number")?.replace(/[^0-9]/g, '')) || null
+                };
+            }).filter(x => x && x.id);
 
-def scrape_most_searched():
-    try:
-        response = requests.get(ANIMEKAI_URL, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        most_searched_div = soup.find("div", class_="most_searched")
-        if not most_searched_div:
-            most_searched_div = soup.find("div", class_="most-searched")
+            const latest_episodes = getSection("#recently-updated .flw-item", ".block_area_home:nth-of-type(1) .flw-item");
+            const new_added = getSection("#recently-added .flw-item", ".block_area_home:nth-of-type(2) .flw-item");
+            const top_upcoming = getSection("#top-upcoming .flw-item", ".block_area_home:nth-of-type(3) .flw-item");
 
-        if not most_searched_div:
-            return {"error": "Could not find most-searched section"}, 404
+            const parseTop10 = (selector) => [...document.querySelectorAll(selector)].map(el => {
+                const a = el.querySelector(".film-name a") || el.querySelector(".film-detail a") || el.querySelector("a");
+                if (!a) return null;
+                const id = a.href?.split("/").pop().split("?")[0];
+                if (!id) return null;
+                
+                const sub = el.querySelector(".tick-sub")?.innerText?.replace(/[^0-9]/g, '');
+                const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
+                const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
 
-        results = []
-        for link in most_searched_div.find_all("a"):
-            name = link.get_text(strip=True)
-            href = link.get("href", "")
-            keyword = (
-                href.split("keyword=")[-1].replace("+", " ")
-                if "keyword=" in href
-                else ""
-            )
-            if name:
-                results.append(
-                    {
-                        "name": name,
-                        "keyword": keyword,
-                        "search_url": f"{ANIMEKAI_URL.rstrip('/')}{href}"
-                        if href.startswith("/")
-                        else href,
+                return {
+                    id: id,
+                    title: a.innerText?.trim() || a.getAttribute("title"),
+                    japanese_title: a.getAttribute("data-jname") || null,
+                    poster: safeAttr(el, "img", "data-src") || safeAttr(el, "img", "src"),
+                    rank: parseInt(safeText(el, ".film-number span, .rank")) || null,
+                    episodes: {
+                        sub: sub ? parseInt(sub) : null,
+                        dub: dub ? parseInt(dub) : null,
+                        total: eps ? parseInt(eps) : null
                     }
-                )
-        return results
-    except Exception as e:
-        return {"error": str(e)}, 500
+                };
+            }).filter(x => x && x.id);
 
+            const top_10 = {
+                today: parseTop10("#top-viewed-day ul li"),
+                week: parseTop10("#top-viewed-week ul li"),
+                month: parseTop10("#top-viewed-month ul li")
+            };
 
-def search_anime(keyword):
-    try:
-        response = requests.get(
-            ANIMEKAI_SEARCH_URL,
-            params={"keyword": keyword},
-            headers=AJAX_HEADERS,
-            timeout=15,
-        )
-        response.raise_for_status()
-        html = response.json().get("result", {}).get("html", "")
-        if not html:
-            return []
+            const genres = [...document.querySelectorAll(".sb-genre-list li a, .genre-list li a")].map(el => el.innerText.trim()).filter(Boolean);
 
-        soup = BeautifulSoup(html, "html.parser")
-        results = []
-        for item in soup.find_all("a", class_="aitem"):
-            title_tag = item.find("h6", class_="title")
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            japanese_title = title_tag.get("data-jp", "") if title_tag else ""
-            poster_img = item.select_one(".poster img")
-            poster = poster_img.get("src", "") if poster_img else ""
-            href = item.get("href", "")
-            slug = href.replace("/watch/", "") if href.startswith("/watch/") else href
+            return { spotlight, trending, latest_episodes, new_added, top_upcoming, top_10, genres };
+        }
+        """)
 
-            sub, dub, anime_type = "", "", ""
-            year = ""
-            rating = ""
-            total_eps = ""
+        await page.close()
+        return home_data
 
-            for span in item.select(".info span"):
-                cls = span.get("class", [])
-                if "sub" in cls:
-                    sub = span.get_text(strip=True)
-                elif "dub" in cls:
-                    dub = span.get_text(strip=True)
-                elif "rating" in cls:
-                    rating = span.get_text(strip=True)
-                else:
-                    b_tag = span.find("b")
-                    text = span.get_text(strip=True)
-                    if b_tag and text.isdigit():
-                        total_eps = text
-                    elif b_tag:
-                        anime_type = text
-                    else:
-                        year = text
+    # ---------------- SEARCH ----------------
+    async def search(self, q: str):
+        page = await self.context.new_page()
+        await page.goto(f"{BASE_URL}/search?keyword={q}", wait_until="domcontentloaded")
 
-            if title:
-                results.append(
-                    {
-                        "title": title,
-                        "japanese_title": japanese_title,
-                        "slug": slug,
-                        "url": f"{ANIMEKAI_URL.rstrip('/')}{href}",
-                        "poster": poster,
-                        "sub_episodes": sub,
-                        "dub_episodes": dub,
-                        "total_episodes": total_eps,
-                        "year": year,
-                        "type": anime_type,
-                        "rating": rating,
-                    }
-                )
-        return results
-    except Exception as e:
-        return {"error": str(e)}, 500
+        results = await page.evaluate("""
+        () => {
+            return [...document.querySelectorAll(".film_list-wrap .flw-item")].map(el => {
+                const a = el.querySelector(".film-name a") || el.querySelector("a");
+                const id = a?.href?.split("/").pop().split("?")[0];
+                const title = a?.innerText?.trim() || a?.getAttribute("title");
+                const jname = a?.getAttribute("data-jname");
+                
+                const posterEl = el.querySelector(".film-poster img");
+                const poster = posterEl?.getAttribute("data-src") || posterEl?.src;
+                
+                const rate = el.querySelector(".tick-rate")?.innerText?.trim();
+                
+                const sub = el.querySelector(".tick-sub")?.innerText?.replace(/[^0-9]/g, '');
+                const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
+                const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
+                
+                const type = el.querySelector(".fd-infor .fdi-item:not(.fdi-duration)")?.innerText?.trim();
+                const duration = el.querySelector(".fd-infor .fdi-duration")?.innerText?.trim();
 
+                return {
+                    id: id,
+                    title: title,
+                    japanese_title: jname || null,
+                    poster: poster || null,
+                    rating: rate || null,
+                    episodes: {
+                        sub: sub ? parseInt(sub) : null,
+                        dub: dub ? parseInt(dub) : null,
+                        total: eps ? parseInt(eps) : null
+                    },
+                    type: type || null,
+                    duration: duration || null
+                };
+            }).filter(x => x.id);
+        }
+        """)
 
-def scrape_home():
-    try:
-        response = requests.get(ANIMEKAI_HOME_URL, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        await page.close()
+        return {"query": q, "total": len(results), "results": results}
 
-        banner = []
-        for slide in soup.select(".swiper-slide"):
-            style = slide.get("style", "")
-            bg_image = style.split("url(")[1].split(")")[0] if "url(" in style else ""
-            title_tag = slide.select_one("p.title")
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            japanese_title = title_tag.get("data-jp", "") if title_tag else ""
-            description = (
-                slide.select_one("p.desc").get_text(strip=True)
-                if slide.select_one("p.desc")
-                else ""
-            )
+    # ---------------- INFO ----------------
+    # ---------------- INFO ----------------
+    async def get_info(self, anime_id: str):
+        page = await self.context.new_page()
+        await page.goto(f"{BASE_URL}/{anime_id}", wait_until="domcontentloaded")
 
-            sub, dub, anime_type = parse_info_spans(slide.select_one(".info"))
+        # Scroll to the bottom of the page to trigger Kaido's lazy-loading
+        # for the "Recommended" section and Images.
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+        await asyncio.sleep(2.5)
 
-            genres = ""
-            info_el = slide.select_one(".info")
-            if info_el:
-                for span in info_el.find_all("span"):
-                    if not span.get("class") and not span.find("b"):
-                        text = span.get_text(strip=True)
-                        if text and not text.isdigit():
-                            genres = text
+        data = await page.evaluate("""
+        () => {
+            const safeText = (document, sel) => document.querySelector(sel)?.innerText?.trim() || null;
+            
+            const info = {
+                title: safeText(document, ".anisc-detail .film-name") || safeText(document, "h1"),
+                japanese_title: document.querySelector(".anisc-detail .film-name")?.getAttribute("data-jname") || null,
+                description: null,
+                poster: document.querySelector(".film-poster img")?.src || null,
+                mal_score: null,
+                anilist_id: null,
+                mal_id: null,
+                stats: {
+                    rating: null,
+                    quality: null,
+                    episodes: { sub: null, dub: null, total: null },
+                    type: null,
+                    duration: null
+                },
+                more_info: {},
+                genres: [],
+                producers: [],
+                studios: [],
+                seasons: [],
+                recommended: [],
+                most_popular: []
+            };
 
-            rating, release, quality = "", "", ""
-            mics = slide.select_one(".mics")
-            if mics:
-                for div in mics.find_all("div", recursive=False):
-                    l, v = div.select_one("div"), div.select_one("span")
-                    if l and v:
-                        lbl = l.get_text(strip=True).lower()
-                        if lbl == "rating":
-                            rating = v.get_text(strip=True)
-                        elif lbl == "release":
-                            release = v.get_text(strip=True)
-                        elif lbl == "quality":
-                            quality = v.get_text(strip=True)
+            // Parse Description & clean out spam
+            let desc = safeText(document, ".film-description .text");
+            if (desc) {
+                desc = desc.split("Kaido is the best site")[0].trim();
+                desc = desc.replace(/\\+ More$/, "").trim();
+                info.description = desc;
+            }
 
-            if title:
-                banner.append(
-                    {
-                        "title": title,
-                        "japanese_title": japanese_title,
-                        "description": description,
-                        "poster": bg_image,
-                        "url": f"{ANIMEKAI_URL.rstrip('/')}{slide.select_one('a.watch-btn').get('href', '')}"
-                        if slide.select_one("a.watch-btn")
-                        else "",
-                        "sub_episodes": sub,
-                        "dub_episodes": dub,
-                        "type": anime_type,
-                        "genres": genres,
-                        "rating": rating,
-                        "release": release,
-                        "quality": quality,
-                    }
-                )
+            // Parse Stats (PG Rating, Quality, Sub, Dub, Eps, Type, Duration)
+            const tickPg = document.querySelector(".tick-item.tick-pg");
+            if (tickPg) info.stats.rating = tickPg.innerText.trim();
 
-        latest = []
-        for item in soup.select(".aitem-wrapper.regular .aitem"):
-            title_tag = item.select_one("a.title")
-            href = (
-                item.select_one("a.poster").get("href", "")
-                if item.select_one("a.poster")
-                else ""
-            )
-            episode = href.split("#ep=")[-1] if "#ep=" in href else ""
-            href = href.split("#ep=")[0]
+            const tickQuality = document.querySelector(".tick-item.tick-quality");
+            if (tickQuality) info.stats.quality = tickQuality.innerText.trim();
 
-            sub, dub, anime_type = parse_info_spans(item.select_one(".info"))
+            const tickSub = document.querySelector(".tick-item.tick-sub");
+            if (tickSub) info.stats.episodes.sub = parseInt(tickSub.innerText.replace(/[^0-9]/g, ''));
 
-            if title_tag:
-                latest.append(
-                    {
-                        "title": title_tag.get_text(strip=True),
-                        "japanese_title": title_tag.get("data-jp", ""),
-                        "poster": item.select_one("img.lazyload").get("data-src", "")
-                        if item.select_one("img.lazyload")
-                        else "",
-                        "url": f"{ANIMEKAI_URL.rstrip('/')}{href}",
-                        "current_episode": episode,
-                        "sub_episodes": sub,
-                        "dub_episodes": dub,
-                        "type": anime_type,
-                    }
-                )
+            const tickDub = document.querySelector(".tick-item.tick-dub");
+            if (tickDub) info.stats.episodes.dub = parseInt(tickDub.innerText.replace(/[^0-9]/g, ''));
 
-        trending = {}
-        for tab_id, tab_label in {
-            "trending": "NOW",
-            "day": "DAY",
-            "week": "WEEK",
-            "month": "MONTH",
-        }.items():
-            container = soup.select_one(f".aitem-col.top-anime[data-id='{tab_id}']")
-            if not container:
-                continue
-            items = []
-            for item in container.find_all("a", class_="aitem"):
-                style = item.get("style", "")
-                poster = style.split("url(")[1].split(")")[0] if "url(" in style else ""
-                sub, dub, anime_type = parse_info_spans(item.select_one(".info"))
+            const tickEps = document.querySelector(".tick-item.tick-eps");
+            if (tickEps) info.stats.episodes.total = parseInt(tickEps.innerText.replace(/[^0-9]/g, ''));
 
-                items.append(
-                    {
-                        "rank": item.select_one(".num").get_text(strip=True)
-                        if item.select_one(".num")
-                        else "",
-                        "title": item.select_one(".detail .title").get_text(strip=True)
-                        if item.select_one(".detail .title")
-                        else "",
-                        "japanese_title": item.select_one(".detail .title").get(
-                            "data-jp", ""
-                        )
-                        if item.select_one(".detail .title")
-                        else "",
-                        "poster": poster,
-                        "url": f"{ANIMEKAI_URL.rstrip('/')}{item.get('href', '')}",
-                        "sub_episodes": sub,
-                        "dub_episodes": dub,
-                        "type": anime_type,
-                    }
-                )
-            trending[tab_label] = items
-
-        return {"banner": banner, "latest_updates": latest, "top_trending": trending}
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-def scrape_anime_info(slug):
-    try:
-        url = f"{ANIMEKAI_URL}watch/{slug}"
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        ani_id = ""
-        sync = soup.select_one("script#syncData")
-        if sync:
-            try:
-                ani_id = _json.loads(sync.string).get("anime_id", "")
-            except:
-                pass
-
-        info_el = soup.select_one(".main-entity .info")
-        sub, dub, atype = parse_info_spans(info_el)
-
-        detail = {}
-        for div in soup.select(".detail > div > div"):
-            text = div.get_text(separator="|", strip=True)
-            if ":" in text:
-                k, v = text.split(":", 1)
-                k = k.strip().lower().replace(" ", "_").replace(":", "")
-                links = div.select("span a")
-                detail[k] = (
-                    [a.get_text(strip=True) for a in links]
-                    if links
-                    else v.strip().strip("|")
-                )
-
-        seasons = []
-        for s in soup.select(".swiper-wrapper.season .aitem"):
-            is_active = "active" in s.get("class", [])
-            d = s.select_one(".detail")
-            seasons.append(
-                {
-                    "title": d.select_one("span").get_text(strip=True) if d else "",
-                    "episodes": d.select_one(".btn").get_text(strip=True) if d else "",
-                    "poster": s.select_one("img").get("src", "")
-                    if s.select_one("img")
-                    else "",
-                    "url": f"{ANIMEKAI_URL.rstrip('/')}{s.select_one('a.poster').get('href', '')}"
-                    if s.select_one("a.poster")
-                    else "",
-                    "active": is_active,
+            document.querySelectorAll(".film-stats .item").forEach(span => {
+                const text = span.innerText.trim();
+                if (text && !span.className.includes("tick-")) {
+                    if (/\\dm$/.test(text) || text.includes("m")) info.stats.duration = text;
+                    else if (['TV', 'Movie', 'OVA', 'ONA', 'Special'].includes(text)) info.stats.type = text;
                 }
+            });
+
+            // Parse Sidebar details
+            document.querySelectorAll(".anisc-info .item").forEach(item => {
+                const headEl = item.querySelector(".item-head");
+                if (!headEl) return;
+                const key = headEl.innerText.replace(":", "").trim().toLowerCase().replace(/ /g, "_");
+                
+                const aTags = item.querySelectorAll("a");
+                if (key === "genres") {
+                    info.genres = [...aTags].map(a => a.innerText.trim());
+                } else if (key === "producers") {
+                    info.producers = [...aTags].map(a => a.innerText.trim());
+                } else if (key === "studios") {
+                    info.studios = [...aTags].map(a => a.innerText.trim());
+                } else {
+                    let val = item.querySelector(".name")?.innerText.trim();
+                    if (!val) {
+                        val = item.innerText.replace(headEl.innerText, "").trim();
+                    }
+                    if (key === "mal_score" || key === "score") {
+                        info.mal_score = parseFloat(val) || val;
+                    } else {
+                        info.more_info[key] = val;
+                    }
+                }
+            });
+
+            // Check if DOM holds MAL or AniList IDs
+            const syncMal = document.querySelector("[data-sync='mal'], [data-mal-id]");
+            if (syncMal) info.mal_id = parseInt(syncMal.getAttribute("data-mal-id") || syncMal.getAttribute("data-id"));
+            
+            const syncAni = document.querySelector("[data-sync='anilist'], [data-anilist-id]");
+            if (syncAni) info.anilist_id = parseInt(syncAni.getAttribute("data-anilist-id") || syncAni.getAttribute("data-id"));
+
+            // Parse Seasons List (With advanced image parsing)
+            document.querySelectorAll(".os-list a").forEach(a => {
+                let pUrl = null;
+                let bgEl = a.querySelector('.season-poster, .os-poster, div[style*="background"]');
+                if (bgEl) {
+                    let style = bgEl.getAttribute('style') || '';
+                    let match = style.match(/url\\(['"]?(.*?)['"]?\\)/);
+                    if (match) pUrl = match[1];
+                }
+                if (!pUrl) {
+                    let img = a.querySelector('img');
+                    if (img) pUrl = img.getAttribute('data-src') || img.src;
+                }
+                
+                info.seasons.push({
+                    id: a.href.split("/").pop().split("?")[0],
+                    title: a.getAttribute("title") || a.innerText.trim(),
+                    is_current: a.classList.contains("active"),
+                    poster: pUrl // Note: If Kaido only has text buttons for seasons, this will be null.
+                });
+            });
+
+            // Helper to parse mini-items (Recommended & Popular)
+            const parseMiniItem = (el) => {
+                if (!el) return null;
+                const a = el.querySelector(".film-name a, .dynamic-name, .film-detail a, .film-title a");
+                if (!a) return null;
+                const id = a.href?.split("/").pop().split("?")[0];
+                if (!id) return null;
+                
+                const sub = el.querySelector(".tick-sub")?.innerText?.replace(/[^0-9]/g, '');
+                const dub = el.querySelector(".tick-dub")?.innerText?.replace(/[^0-9]/g, '');
+                const eps = el.querySelector(".tick-eps")?.innerText?.replace(/[^0-9]/g, '');
+                
+                let itemType = null;
+                const validTypes = ['TV', 'MOVIE', 'OVA', 'ONA', 'SPECIAL', 'MUSIC'];
+                
+                // Method 1: Target common elements
+                el.querySelectorAll('.fdi-item, span').forEach(node => {
+                    let txt = node.innerText.trim().toUpperCase();
+                    if (validTypes.includes(txt)) {
+                        itemType = txt === 'MOVIE' ? 'Movie' : (txt === 'SPECIAL' ? 'Special' : (txt === 'MUSIC' ? 'Music' : txt));
+                    }
+                });
+                
+                // Method 2: Fallback Regex on all text content (Bulletproof)
+                if (!itemType) {
+                    let match = (el.innerText || '').match(/\\b(TV|Movie|OVA|ONA|Special|Music)\\b/i);
+                    if (match) {
+                        let txt = match[1].toUpperCase();
+                        itemType = txt === 'MOVIE' ? 'Movie' : (txt === 'SPECIAL' ? 'Special' : (txt === 'MUSIC' ? 'Music' : txt));
+                    }
+                }
+                
+                return {
+                    id: id,
+                    title: a.innerText?.trim() || a.getAttribute("title"),
+                    japanese_title: a.getAttribute("data-jname") || null,
+                    poster: el.querySelector("img")?.getAttribute("data-src") || el.querySelector("img")?.src || null,
+                    type: itemType,
+                    episodes: {
+                        sub: sub ? parseInt(sub) : null,
+                        dub: dub ? parseInt(dub) : null,
+                        total: eps ? parseInt(eps) : null
+                    }
+                };
+            };
+
+            // DYNAMICALLY FIND "RECOMMENDED" SECTION
+            let recItems = [];
+            document.querySelectorAll("h2, .cat-heading").forEach(h => {
+                if (h.innerText.toLowerCase().includes("recommended")) {
+                    let container = h.closest(".block_area, section, div.container, .wrap");
+                    if (container) {
+                        let items = container.querySelectorAll(".flw-item");
+                        if (items.length > 0) recItems = Array.from(items);
+                    }
+                }
+            });
+            if (recItems.length === 0) recItems = document.querySelectorAll("#anime-recommended .flw-item"); // Fallback
+            info.recommended = [...recItems].map(parseMiniItem).filter(x => x && x.id);
+
+            // DYNAMICALLY FIND "MOST POPULAR" SECTION
+            let popItems = [];
+            document.querySelectorAll("h2, .cat-heading").forEach(h => {
+                if (h.innerText.toLowerCase().includes("most popular")) {
+                    let container = h.closest(".block_area, section, .sidebar");
+                    if (container) {
+                        let items = container.querySelectorAll("ul li, .ulclear li");
+                        if (items.length > 0) popItems = Array.from(items);
+                    }
+                }
+            });
+            if (popItems.length === 0) popItems = document.querySelectorAll("#toppopular ul li, .mop-list li, .sidebar-list li"); // Fallback
+            info.most_popular = [...popItems].map(parseMiniItem).filter(x => x && x.id);
+
+            return info;
+        }
+        """)
+        await page.close()
+
+        # Fallback: Query AniList GraphQL to fetch IDs and Score if missing or to augment data
+        title_to_search = data.get("japanese_title") or data.get("title")
+        if title_to_search and (
+            not data.get("anilist_id") or not data.get("mal_score")
+        ):
+            anilist_data = await self._fetch_anilist_metadata(title_to_search)
+            if anilist_data:
+                data["anilist_id"] = data.get("anilist_id") or anilist_data.get("id")
+                data["mal_id"] = data.get("mal_id") or anilist_data.get("idMal")
+
+                # AniList average score is out of 100, convert to MAL scale (out of 10)
+                score_100 = anilist_data.get("averageScore")
+                if score_100 and not data.get("mal_score"):
+                    data["mal_score"] = score_100 / 10
+
+        return {"id": anime_id, **data}
+
+    # ---------------- EPISODES ----------------
+    async def get_episodes(self, anime_id: str):
+        page = await self.context.new_page()
+        numeric_id = anime_id.split("-")[-1]
+
+        try:
+            await page.goto(f"{BASE_URL}/{anime_id}", wait_until="domcontentloaded")
+            episodes = await page.evaluate(
+                f"""
+            async (id) => {{
+                try {{
+                    let resp = await fetch(`/ajax/v2/episode/list/${{id}}`, {{ headers: {{ "X-Requested-With": "XMLHttpRequest" }} }});
+                    let data = await resp.json().catch(()=>({{}}));
+                    if (!data.html && !data.result) {{
+                        resp = await fetch(`/ajax/episode/list/${{id}}`, {{ headers: {{ "X-Requested-With": "XMLHttpRequest" }} }});
+                        data = await resp.json().catch(()=>({{}}));
+                    }}
+                    const htmlContent = data.html || data.result || data.data;
+                    if (htmlContent) {{
+                        const div = document.createElement("div"); div.innerHTML = htmlContent;
+                        const eps = [];
+                        div.querySelectorAll("a[data-id], .ep-item[data-id]").forEach(el => {{
+                            const num = el.getAttribute("data-number") || el.getAttribute("data-num");
+                            const epId = el.getAttribute("data-id");
+                            if (num && epId) eps.push({{ episode: parseFloat(num), id: epId, title: el.getAttribute("title") || el.innerText.trim() }});
+                        }});
+                        return eps;
+                    }}
+                }} catch (e) {{ }} return [];
+            }}
+            """,
+                numeric_id,
+            )
+            unique_eps = {ep["id"]: ep for ep in episodes}.values()
+            episodes = sorted(unique_eps, key=lambda x: x["episode"])
+        finally:
+            await page.close()
+        return {"id": anime_id, "total": len(episodes), "episodes": episodes}
+
+    # ---------------- SERVERS ----------------
+    async def get_servers(self, anime_id: str, ep: str):
+        page = await self.context.new_page()
+        try:
+            await page.goto(f"{BASE_URL}/{anime_id}", wait_until="domcontentloaded")
+            servers_data = await page.evaluate(
+                f"""
+                async (epId) => {{
+                    try {{
+                        let res = await fetch(`/ajax/v2/episode/servers?episodeId=${{epId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                        let data = await res.json().catch(()=>({{}}));
+                        if (!data.html && !data.result) {{
+                            res = await fetch(`/ajax/episode/servers?episodeId=${{epId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                            data = await res.json().catch(()=>({{}}));
+                        }}
+                        const div = document.createElement('div'); div.innerHTML = data.html || data.result || data.data || "";
+                        const results = {{ sub: [], dub: [], raw: [] }};
+                        div.querySelectorAll('.server-item, .server, .item.server').forEach(el => {{
+                            let type = el.getAttribute('data-type');
+                            if (!type) {{
+                                const parent = el.closest('.servers-sub, .servers-dub, .servers-raw, [data-type]');
+                                if (parent) {{
+                                    if (parent.classList.contains('servers-sub')) type = 'sub';
+                                    else if (parent.classList.contains('servers-dub')) type = 'dub';
+                                    else type = parent.getAttribute('data-type');
+                                }}
+                            }}
+                            type = (type || 'sub').toLowerCase().trim();
+                            if (!results[type]) results[type] = [];
+                            let serverId = el.getAttribute('data-id') || el.getAttribute('data-server-id');
+                            if (!serverId) {{
+                                const child = el.querySelector('[data-id], [data-server-id]');
+                                if (child) serverId = child.getAttribute('data-id') || child.getAttribute('data-server-id');
+                            }}
+                            const serverName = (el.innerText || '').trim().toLowerCase();
+                            if (serverId && serverName) results[type].push({{ serverName, serverId }});
+                        }});
+                        return results;
+                    }} catch (err) {{ return {{ sub: [], dub: [], raw: [], error: err.message }}; }}
+                }}
+            """,
+                ep,
+            )
+            for t in ["sub", "dub", "raw"]:
+                if t in servers_data:
+                    for s in servers_data[t]:
+                        s["serverName"] = self._map_server_name(s["serverName"])
+            return {"episode": ep, "servers": servers_data}
+        finally:
+            await page.close()
+
+    # ---------------- RESOLVE ----------------
+    async def resolve(self, anime_id: str, ep: str, req_type: str, req_server: str):
+        page = await self.context.new_page()
+        await Stealth().apply_stealth_async(page)
+
+        m3u8_link = None
+        embed_link = None
+
+        stream_data = {
+            "intro": {"start": 0, "end": 0},
+            "outro": {"start": 0, "end": 0},
+            "tracks": [],
+        }
+
+        try:
+            await page.goto(f"{BASE_URL}/{anime_id}", wait_until="domcontentloaded")
+
+            # 1. Fetch Servers
+            servers_data = await page.evaluate(
+                f"""
+                async (epId) => {{
+                    try {{
+                        let res = await fetch(`/ajax/v2/episode/servers?episodeId=${{epId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                        let data = await res.json().catch(()=>({{}}));
+                        if (!data.html && !data.result) {{
+                            res = await fetch(`/ajax/episode/servers?episodeId=${{epId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                            data = await res.json().catch(()=>({{}}));
+                        }}
+                        const div = document.createElement('div'); div.innerHTML = data.html || data.result || data.data || "";
+                        const results = {{ sub: [], dub: [], raw: [] }};
+                        div.querySelectorAll('.server-item, .server, .item.server').forEach(el => {{
+                            let t = el.getAttribute('data-type');
+                            if (!t) {{
+                                const parent = el.closest('.servers-sub, .servers-dub, .servers-raw');
+                                if (parent) t = parent.classList.contains('servers-sub') ? 'sub' : 'dub';
+                            }}
+                            t = (t || 'sub').toLowerCase().trim();
+                            if (!results[t]) results[t] = [];
+                            let serverId = el.getAttribute('data-id') || el.getAttribute('data-server-id');
+                            if (!serverId) {{
+                                const child = el.querySelector('[data-id], [data-server-id]');
+                                if (child) serverId = child.getAttribute('data-id') || child.getAttribute('data-server-id');
+                            }}
+                            const serverName = (el.innerText || '').trim().toLowerCase();
+                            if (serverId && serverName) results[t].push({{ serverName, serverId }});
+                        }});
+                        return results;
+                    }} catch (e) {{ return {{ sub: [], dub: [] }}; }}
+                }}
+            """,
+                ep,
             )
 
-        bg_el = soup.select_one(".watch-section-bg")
-        banner = (
-            bg_el.get("style", "").split("url(")[1].split(")")[0]
-            if bg_el and "url(" in bg_el.get("style", "")
-            else ""
-        )
+            target_list = servers_data.get(req_type.lower(), [])
+            actual_type = req_type.lower()
 
-        return {
-            "ani_id": ani_id,
-            "title": soup.select_one("h1.title").get_text(strip=True)
-            if soup.select_one("h1.title")
-            else "",
-            "japanese_title": soup.select_one("h1.title").get("data-jp", "")
-            if soup.select_one("h1.title")
-            else "",
-            "description": soup.select_one(".desc").get_text(strip=True)
-            if soup.select_one(".desc")
-            else "",
-            "poster": soup.select_one(".poster img[itemprop='image']").get("src", "")
-            if soup.select_one(".poster img[itemprop='image']")
-            else "",
-            "banner": banner,
-            "sub_episodes": sub,
-            "dub_episodes": dub,
-            "type": atype,
-            "rating": info_el.select_one(".rating").get_text(strip=True)
-            if info_el and info_el.select_one(".rating")
-            else "",
-            "mal_score": soup.select_one(".rate-box .value").get_text(strip=True)
-            if soup.select_one(".rate-box .value")
-            else "",
-            "detail": detail,
-            "seasons": seasons,
-        }
-    except Exception as e:
-        return {"error": str(e)}, 500
+            if not target_list and servers_data.get("sub"):
+                target_list = servers_data["sub"]
+                actual_type = "sub"
 
+            if not target_list:
+                return {"error": "No servers available for this episode."}
 
-def fetch_episodes(ani_id):
-    try:
-        encoded = encode_token(ani_id)
-        if not encoded:
-            return {"error": "Token encryption failed"}, 500
+            available_servers = []
+            for s in target_list:
+                mapped = self._map_server_name(s["serverName"])
+                available_servers.append(
+                    {"serverName": mapped, "serverId": s["serverId"]}
+                )
 
-        response = requests.get(
-            ANIMEKAI_EPISODES_URL,
-            params={"ani_id": ani_id, "_": encoded},
-            headers=AJAX_HEADERS,
-            timeout=15,
-        )
-        response.raise_for_status()
-        html = response.json().get("result", "")
-        if not html:
-            return []
+            # 2. Extract Server Match
+            server_id = None
+            req_server_lower = req_server.lower()
+            matched_server_name = None
 
-        soup = BeautifulSoup(html, "html.parser")
-        episodes = []
-        for ep in soup.select(".eplist a"):
-            langs = ep.get("langs", "0")
-            episodes.append(
-                {
-                    "number": ep.get("num", ""),
-                    "slug": ep.get("slug", ""),
-                    "title": ep.select_one("span").get_text(strip=True)
-                    if ep.select_one("span")
-                    else "",
-                    "japanese_title": ep.select_one("span").get("data-jp", "")
-                    if ep.select_one("span")
-                    else "",
-                    "token": ep.get("token", ""),
-                    "has_sub": bool(int(langs) & 1) if langs.isdigit() else False,
-                    "has_dub": bool(int(langs) & 2) if langs.isdigit() else False,
-                }
+            for i, s in enumerate(target_list):
+                raw_name = s["serverName"].lower()
+                mapped_name = available_servers[i]["serverName"]
+                if req_server_lower in raw_name or req_server_lower == mapped_name:
+                    server_id = s["serverId"]
+                    matched_server_name = mapped_name
+                    break
+
+            if not server_id:
+                server_id = available_servers[0]["serverId"]
+                matched_server_name = available_servers[0]["serverName"]
+
+            # 3. Fetch Embed Link
+            embed_data = await page.evaluate(
+                f"""
+                async (sId) => {{
+                    try {{
+                        let res = await fetch(`/ajax/v2/episode/sources?id=${{sId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                        let data = await res.json().catch(()=>({{}}));
+                        if (!data.link) {{
+                            res = await fetch(`/ajax/episode/sources?id=${{sId}}`, {{ headers: {{"X-Requested-With": "XMLHttpRequest"}} }});
+                            data = await res.json().catch(()=>({{}}));
+                        }}
+                        return data;
+                    }} catch (e) {{ return {{ error: e.message }}; }}
+                }}
+            """,
+                server_id,
             )
-        return episodes
-    except Exception as e:
-        return {"error": str(e)}, 500
 
-
-def fetch_servers(ep_token):
-    try:
-        encoded = encode_token(ep_token)
-        if not encoded:
-            return {"error": "Token encryption failed"}, 500
-
-        response = requests.get(
-            ANIMEKAI_SERVERS_URL,
-            params={"token": ep_token, "_": encoded},
-            headers=AJAX_HEADERS,
-            timeout=15,
-        )
-        response.raise_for_status()
-        html = response.json().get("result", "")
-        soup = BeautifulSoup(html, "html.parser")
-
-        servers = {}
-        for group in soup.select(".server-items"):
-            lang = group.get("data-id", "unknown")
-            servers[lang] = [
-                {
-                    "name": s.get_text(strip=True),
-                    "server_id": s.get("data-sid", ""),
-                    "episode_id": s.get("data-eid", ""),
-                    "link_id": s.get("data-lid", ""),
+            embed_link = embed_data.get("link")
+            if not embed_link:
+                return {
+                    "error": "Could not extract embed link from the selected server."
                 }
-                for s in group.select(".server")
-            ]
 
+            if "?" in embed_link:
+                embed_link += "&z=&autoPlay=1&oa=1&asi=1&_debug=false"
+            else:
+                embed_link += "?z=&autoPlay=1&oa=1&asi=1&_debug=false"
+
+            # 4. Aggressive Network Interceptors
+            def capture_request(req):
+                nonlocal m3u8_link
+                url = req.url
+                if ".m3u8" in url and "ping" not in url:
+                    if not m3u8_link:
+                        m3u8_link = url
+
+            async def capture_response(res):
+                try:
+                    if (
+                        res.request.method != "OPTIONS"
+                        and "application/json" in res.headers.get("content-type", "")
+                    ):
+                        data = await res.json()
+                        if isinstance(data, dict):
+                            if (
+                                "tracks" in data
+                                and isinstance(data["tracks"], list)
+                                and len(data["tracks"]) > 0
+                            ):
+                                stream_data["tracks"] = data["tracks"]
+                            if "intro" in data and data["intro"]:
+                                stream_data["intro"] = data["intro"]
+                            if "outro" in data and data["outro"]:
+                                stream_data["outro"] = data["outro"]
+                except:
+                    pass
+
+            page.on("request", capture_request)
+            page.on("response", capture_response)
+
+            # 5. Rip the stream
+            await page.goto(
+                embed_link, referer=f"{BASE_URL}/", wait_until="domcontentloaded"
+            )
+
+            for _ in range(12):
+                if m3u8_link:
+                    break
+                await page.evaluate("""
+                () => {
+                    const rPlay = document.getElementById('click-to-play');
+                    if (rPlay) rPlay.click();
+                    const jwPlay = document.querySelector('.jw-video, .jw-button-color, .jw-icon-display, .play-btn');
+                    if (jwPlay) jwPlay.click();
+                    document.querySelectorAll('video').forEach(v => {
+                        v.muted = false;
+                        v.play().catch(()=>{});
+                    });
+                }
+                """)
+                await asyncio.sleep(0.75)
+
+            # 6. Fallback Track Extraction
+            if not stream_data["tracks"]:
+                stream_data["tracks"] = await page.evaluate("""
+                () => {
+                    let extracted = [];
+                    try {
+                        if (typeof jwplayer === 'function') {
+                            const config = jwplayer().getConfig();
+                            if (config && config.tracks && config.tracks.length > 0) {
+                                extracted = config.tracks.map(t => ({
+                                    file: t.file, label: t.label || t.name || "English",
+                                    kind: t.kind || "captions", default: t.default || false
+                                }));
+                            }
+                        }
+                    } catch(e) {}
+                    
+                    if (extracted.length === 0) {
+                        extracted = Array.from(document.querySelectorAll('track')).map(t => ({
+                            file: t.src, label: t.label || t.srclang || "English",
+                            kind: t.kind || "captions", default: t.default || false
+                        }));
+                    }
+                    return extracted.filter(t => t.file && t.kind !== "thumbnails");
+                }
+                """)
+
+        except Exception as e:
+            return {"episode": ep, "error": f"An error occurred: {str(e)}"}
+        finally:
+            await page.close()
+
+        if not m3u8_link:
+            return {
+                "episode": ep,
+                "type": actual_type,
+                "server": matched_server_name,
+                "error": "Embed loaded, but no m3u8 stream was detected.",
+            }
+
+        # ---------------- FORMAT TRACKS & PRIORITIZE ENGLISH ONLY ----------------
+        clean_tracks = []
+        for track in stream_data.get("tracks", []):
+            label = track.get("label", "English")
+            # Only append valid VTT subtitle tracks, remove image sprites, AND enforce English only
+            if track.get("kind") != "thumbnails" and track.get("file"):
+                if "english" in label.lower() or label.lower() == "en":
+                    clean_tracks.append(
+                        {
+                            "file": track.get("file"),
+                            "label": label,
+                            "kind": track.get("kind", "captions"),
+                            "default": True,  # Force the English track to default to True
+                        }
+                    )
+
+        # 7. Final Output
         return {
-            "watching": soup.select_one(".server-note p").get_text(strip=True)
-            if soup.select_one(".server-note p")
-            else "",
-            "servers": servers,
+            "episode": ep,
+            "type": actual_type,
+            "embed_url": embed_link,
+            "available_servers": available_servers,
+            "sources": [{"file": m3u8_link, "type": "hls"}],
+            "tracks": clean_tracks,
+            "encrypted": False,
+            "intro": stream_data.get("intro", {"start": 0, "end": 0}),
+            "outro": stream_data.get("outro", {"start": 0, "end": 0}),
+            "server": matched_server_name,
         }
-    except Exception as e:
-        return {"error": str(e)}, 500
 
 
-def resolve_source(link_id):
-    try:
-        encoded = encode_token(link_id)
-        if not encoded:
-            return {"error": "Token encryption failed"}, 500
-
-        resp = requests.get(
-            ANIMEKAI_LINKS_VIEW_URL,
-            params={"id": link_id, "_": encoded},
-            headers=AJAX_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        encrypted_result = resp.json().get("result", "")
-
-        embed_data = decode_kai(encrypted_result)
-        if not embed_data:
-            return {"error": "Embed decryption failed"}, 500
-        embed_url = embed_data.get("url", "")
-        if not embed_url:
-            return {"error": "No embed URL found"}, 500
-
-        video_id = embed_url.rstrip("/").split("/")[-1]
-        embed_base = (
-            embed_url.rsplit("/e/", 1)[0]
-            if "/e/" in embed_url
-            else embed_url.rsplit("/", 1)[0]
-        )
-        media_resp = requests.get(
-            f"{embed_base}/media/{video_id}", headers=HEADERS, timeout=15
-        )
-        media_resp.raise_for_status()
-        encrypted_media = media_resp.json().get("result", "")
-
-        final_data = decode_mega(encrypted_media)
-        if not final_data:
-            return {"error": "Media decryption failed"}, 500
-
-        return {
-            "embed_url": embed_url,
-            "skip": embed_data.get("skip", {}),
-            "sources": final_data.get("sources", []),
-            "tracks": final_data.get("tracks", []),
-            "download": final_data.get("download", ""),
-        }
-    except Exception as e:
-        return {"error": str(e)}, 500
+kaido = Kaido()
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify(
-        {
-            "success": True,
-            "api": "Anime Kai REST API",
-            "version": "1.1.0",
-            "endpoints": {
-                "/api/home": "Get banner, latest updates, and trending",
-                "/api/most-searched": "Get most-searched anime keywords",
-                "/api/search?keyword=...": "Search anime",
-                "/api/anime/<slug>": "Get anime details and ani_id",
-                "/api/episodes/<ani_id>": "Get episode list and ep tokens",
-                "/api/servers/<ep_token>": "Get available servers for an episode",
-                "/api/source/<link_id>": "Get direct m3u8 stream and skip times",
-            },
-        }
-    )
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await kaido.start()
+    yield
+    await kaido.stop()
 
 
-@app.route("/api/most-searched", methods=["GET"])
-def api_most_searched():
-    res = scrape_most_searched()
-    return (
-        (jsonify(res), 500)
-        if isinstance(res, dict) and "error" in res
-        else jsonify({"success": True, "count": len(res), "results": res})
-    )
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-@app.route("/api/search", methods=["GET"])
-def api_search():
-    kw = request.args.get("keyword", "").strip()
-    if not kw:
-        return jsonify({"error": "Keyword is required"}), 400
-    res = search_anime(kw)
-    return (
-        (jsonify(res), 500)
-        if isinstance(res, dict) and "error" in res
-        else jsonify(
-            {"success": True, "keyword": kw, "count": len(res), "results": res}
-        )
-    )
+@app.get("/", response_class=JSONResponse)
+async def root():
+    return {"status": "ok", "message": "Kaido API is running!"}
 
 
-@app.route("/api/home", methods=["GET"])
-def api_home():
-    res = scrape_home()
-    return (
-        (jsonify(res), 500)
-        if isinstance(res, dict) and "error" in res
-        else jsonify({"success": True, **res})
-    )
+@app.get("/home")
+async def api_home():
+    return await kaido.get_home()
 
 
-@app.route("/api/anime/<slug>", methods=["GET"])
-def api_anime_info(slug):
-    res = scrape_anime_info(slug)
-    return (jsonify(res), 500) if "error" in res else jsonify({"success": True, **res})
+@app.get("/search")
+async def api_search(q: str):
+    return await kaido.search(q)
 
 
-@app.route("/api/episodes/<ani_id>", methods=["GET"])
-def api_episodes(ani_id):
-    res = fetch_episodes(ani_id)
-    return (
-        (jsonify(res), 500)
-        if isinstance(res, dict) and "error" in res
-        else jsonify(
-            {"success": True, "ani_id": ani_id, "count": len(res), "episodes": res}
-        )
-    )
+@app.get("/info/{anime_id}")
+async def api_info(anime_id: str):
+    return await kaido.get_info(anime_id)
 
 
-@app.route("/api/servers/<ep_token>", methods=["GET"])
-def api_servers(ep_token):
-    res = fetch_servers(ep_token)
-    return (jsonify(res), 500) if "error" in res else jsonify({"success": True, **res})
+@app.get("/episodes/{anime_id}")
+async def api_episodes(anime_id: str):
+    return await kaido.get_episodes(anime_id)
 
 
-@app.route("/api/source/<link_id>", methods=["GET"])
-def api_source(link_id):
-    res = resolve_source(link_id)
-    return (jsonify(res), 500) if "error" in res else jsonify({"success": True, **res})
+@app.get("/servers/{anime_id}")
+async def api_servers(anime_id: str, ep: str = Query(...)):
+    return await kaido.get_servers(anime_id, ep)
+
+
+@app.get("/resolve/{anime_id}")
+async def api_resolve(
+    anime_id: str,
+    ep: str = Query(...),
+    type: str = Query("sub", description="'sub' or 'dub'"),
+    server: str = Query("hd-1", description="'hd-1' (vidstreaming), 'hd-2' (vidcloud)"),
+):
+    return await kaido.resolve(anime_id, ep, type, server)
+
+
+@app.get("/seasons/{anime_id}")
+async def api_seasons(anime_id: str):
+    return await kaido.get_seasons(anime_id)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=7860)
